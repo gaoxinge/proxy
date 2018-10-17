@@ -2,7 +2,6 @@ package proxy
 
 import (
 	"net/http"
-	"fmt"
 	"net"
 	"io"
 	"log"
@@ -30,17 +29,17 @@ func NewConnect(nextAddr string) *Connect {
 }
 
 func (connect *Connect) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	fmt.Printf("Received request %s %s %s %s %s %s\n", r.Method, r.Host, r.RemoteAddr, r.RequestURI, r.URL, r.URL.String())
-
 	if connect.nextAddr == "" {
+		log.Printf("receive %s request from %s to %s\n", r.Method, r.RemoteAddr, r.Host)
 		if r.Method == "CONNECT" {
 			handleConnect(w, r)
 		} else {
 			handleMethod(w, r)
 		}
 	} else {
+		log.Printf("receive %s request from %s to %s\n", r.Method, r.RemoteAddr, connect.nextAddr)
 		if r.Method == "CONNECT" {
-
+			
 		} else {
 
 		}
@@ -58,8 +57,21 @@ func handleConnect(w http.ResponseWriter, r *http.Request) {
 	client, _, _ := hij.Hijack()
 	client.Write([]byte("HTTP/1.0 200 Connection Established\r\n\r\n"))
 
-	go io.Copy(server, client)
-	io.Copy(client, server)
+	done := make(chan struct{})
+	go func() {
+		if _, err := io.Copy(server, client); err != nil {
+			log.Println(err)
+		}
+		tcpServer := server.(*net.TCPConn)
+		tcpServer.CloseWrite()
+		done <- struct{}{}
+	}()
+	if _, err := io.Copy(client, server); err != nil {
+		log.Println(err)
+	}
+	tcpServer := server.(*net.TCPConn)
+	tcpServer.CloseRead()
+	<- done
 }
 
 func handleMethod(w http.ResponseWriter, r *http.Request) {
