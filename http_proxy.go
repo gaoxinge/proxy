@@ -5,6 +5,8 @@ import (
 	"net"
 	"io"
 	"log"
+	"time"
+	"net/url"
 )
 
 type HttpProxy struct{
@@ -39,9 +41,9 @@ func (connect *Connect) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	} else {
 		log.Printf("receive %s request from %s to %s\n", r.Method, r.RemoteAddr, connect.nextAddr)
 		if r.Method == "CONNECT" {
-			
+			handleConnectNext(w, r, connect)
 		} else {
-
+			handleMethodNext(w, r, connect)
 		}
 	}
 }
@@ -113,6 +115,94 @@ func copyRequest(r *http.Request) (*http.Request, error) {
 	if proxyConn := req.Header.Get("Proxy-Connection"); proxyConn != "" {
 		req.Header.Del("Proxy-Connection")
 		req.Header.Set("Connection", proxyConn)
+	}
+
+	if ip, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
+		if xff := req.Header.Get("X-Forwarded-For"); xff != "" {
+			ip = xff + ", " + ip
+		}
+		req.Header.Set("X-Forwarded-For", ip)
+	}
+
+	return req, nil
+}
+
+func handleConnectNext(w http.ResponseWriter, r *http.Request, c *Connect) {
+	server, err := net.Dial("tcp", c.nextAddr)
+	if err != nil {
+		log.Println(err)
+		return
+	}
+
+	hij, _ := w.(http.Hijacker)
+	client, _, _ := hij.Hijack()
+	client.Write([]byte("HTTP/1.0 200 Connection Established\r\n\r\n"))
+
+	done := make(chan struct{})
+	go func() {
+		if _, err := io.Copy(server, client); err != nil {
+			log.Println(err)
+		}
+		tcpServer := server.(*net.TCPConn)
+		tcpServer.CloseWrite()
+		done <- struct{}{}
+	}()
+	if _, err := io.Copy(client, server); err != nil {
+		log.Println(err)
+	}
+	tcpServer := server.(*net.TCPConn)
+	tcpServer.CloseRead()
+	<- done
+}
+
+func handleMethodNext(w http.ResponseWriter, r *http.Request, c *Connect) {
+	req, err := copyRequestNext(r)
+	if err != nil {
+		log.Println(err)
+		return
+	}
+
+	proxy := func (r *http.Request) (*url.URL, error) {
+		return url.Parse("http://" + c.nextAddr)
+	}
+	server := &http.Transport{
+		Proxy: proxy,
+		DialContext: (&net.Dialer{
+			Timeout:   30 * time.Second,
+			KeepAlive: 30 * time.Second,
+			DualStack: true,
+		}).DialContext,
+		MaxIdleConns:          100,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+	}
+	resp, err := server.RoundTrip(req)
+	if err != nil {
+		log.Println(err)
+		return
+	}
+
+	for key, value := range resp.Header {
+		for _, v := range value {
+			w.Header().Add(key, v)
+		}
+	}
+	w.WriteHeader(resp.StatusCode)
+	io.Copy(w, resp.Body)
+	resp.Body.Close()
+}
+
+func copyRequestNext(r *http.Request) (*http.Request, error) {
+	req, err := http.NewRequest(r.Method, r.URL.String(), r.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	for key, value := range r.Header {
+		for _, v := range value {
+			req.Header.Add(key, v)
+		}
 	}
 
 	if ip, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
