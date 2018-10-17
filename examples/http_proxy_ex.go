@@ -1,8 +1,10 @@
 package main
 
-import "proxy"
+import (
+	"proxy"
+)
 
 func main() {
 	httpProxy := proxy.NewHttpProxy("localhost:8080")
-	httpProxy.Start()
+	httpProxy.Start("")
 }
