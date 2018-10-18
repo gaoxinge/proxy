@@ -38,13 +38,13 @@ func (connect *Connect) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if r.Method == "CONNECT" {
-		handleConnect(w, r, connect)
+		handleHttpConnect(w, r, connect)
 	} else {
-		handleMethod(w, r, connect)
+		handleHttpMethod(w, r, connect)
 	}
 }
 
-func handleConnect(w http.ResponseWriter, r *http.Request, c *Connect) {
+func handleHttpConnect(w http.ResponseWriter, r *http.Request, c *Connect) {
 	var server net.Conn
 	var err error
 	if c.nextAddr == "" {
@@ -83,7 +83,7 @@ func handleConnect(w http.ResponseWriter, r *http.Request, c *Connect) {
 	<- done
 }
 
-func handleMethod(w http.ResponseWriter, r *http.Request, c *Connect) {
+func handleHttpMethod(w http.ResponseWriter, r *http.Request, c *Connect) {
 	req, err := copyRequest(r, c)
 	if err != nil {
 		log.Println(err)
