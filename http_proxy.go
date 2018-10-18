@@ -33,23 +33,25 @@ func NewConnect(nextAddr string) *Connect {
 func (connect *Connect) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if connect.nextAddr == "" {
 		log.Printf("receive %s request from %s to %s\n", r.Method, r.RemoteAddr, r.Host)
-		if r.Method == "CONNECT" {
-			handleConnect(w, r)
-		} else {
-			handleMethod(w, r)
-		}
 	} else {
 		log.Printf("receive %s request from %s to %s\n", r.Method, r.RemoteAddr, connect.nextAddr)
-		if r.Method == "CONNECT" {
-			handleConnectNext(w, r, connect)
-		} else {
-			handleMethodNext(w, r, connect)
-		}
+	}
+
+	if r.Method == "CONNECT" {
+		handleConnect(w, r, connect)
+	} else {
+		handleMethod(w, r, connect)
 	}
 }
 
-func handleConnect(w http.ResponseWriter, r *http.Request) {
-	server, err := net.Dial("tcp", r.Host)
+func handleConnect(w http.ResponseWriter, r *http.Request, c *Connect) {
+	var server net.Conn
+	var err error
+	if c.nextAddr == "" {
+		server, err = net.Dial("tcp", r.Host)
+	} else {
+		server, err = net.Dial("tcp", c.nextAddr)
+	}
 	if err != nil {
 		log.Println(err)
 		return
@@ -57,7 +59,12 @@ func handleConnect(w http.ResponseWriter, r *http.Request) {
 
 	hij, _ := w.(http.Hijacker)
 	client, _, _ := hij.Hijack()
-	client.Write([]byte("HTTP/1.0 200 Connection Established\r\n\r\n"))
+
+	if c.nextAddr == "" {
+		client.Write([]byte("HTTP/1.0 200 Connection Established\r\n\r\n"))
+	} else {
+		server.Write([]byte(r.Method + " " + r.RequestURI + " " + r.Proto + "\r\n\r\n"))
+	}
 
 	done := make(chan struct{})
 	go func() {
@@ -76,14 +83,34 @@ func handleConnect(w http.ResponseWriter, r *http.Request) {
 	<- done
 }
 
-func handleMethod(w http.ResponseWriter, r *http.Request) {
-	req, err := copyRequest(r)
+func handleMethod(w http.ResponseWriter, r *http.Request, c *Connect) {
+	req, err := copyRequest(r, c)
 	if err != nil {
 		log.Println(err)
 		return
 	}
 
-	server := http.DefaultTransport
+	var server http.RoundTripper
+	if c.nextAddr == "" {
+		server = http.DefaultTransport
+	} else {
+		proxy := func(r *http.Request) (*url.URL, error) {
+			return url.Parse("http://" + c.nextAddr)
+		}
+		server = &http.Transport{
+			Proxy: proxy,
+			DialContext: (&net.Dialer{
+				Timeout:   30 * time.Second,
+				KeepAlive: 30 * time.Second,
+				DualStack: true,
+			}).DialContext,
+			MaxIdleConns:          100,
+			IdleConnTimeout:       90 * time.Second,
+			TLSHandshakeTimeout:   10 * time.Second,
+			ExpectContinueTimeout: 1 * time.Second,
+		}
+	}
+
 	resp, err := server.RoundTrip(req)
 	if err != nil {
 		log.Println(err)
@@ -96,11 +123,13 @@ func handleMethod(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	w.WriteHeader(resp.StatusCode)
-	io.Copy(w, resp.Body)
+	if _, err := io.Copy(w, resp.Body); err != nil {
+		log.Println(err)
+	}
 	resp.Body.Close()
 }
 
-func copyRequest(r *http.Request) (*http.Request, error) {
+func copyRequest(r *http.Request, c *Connect) (*http.Request, error) {
 	req, err := http.NewRequest(r.Method, r.URL.String(), r.Body)
 	if err != nil {
 		return nil, err
@@ -112,96 +141,10 @@ func copyRequest(r *http.Request) (*http.Request, error) {
 		}
 	}
 
-	if proxyConn := req.Header.Get("Proxy-Connection"); proxyConn != "" {
-		req.Header.Del("Proxy-Connection")
-		req.Header.Set("Connection", proxyConn)
-	}
-
-	if ip, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
-		if xff := req.Header.Get("X-Forwarded-For"); xff != "" {
-			ip = xff + ", " + ip
-		}
-		req.Header.Set("X-Forwarded-For", ip)
-	}
-
-	return req, nil
-}
-
-func handleConnectNext(w http.ResponseWriter, r *http.Request, c *Connect) {
-	server, err := net.Dial("tcp", c.nextAddr)
-	if err != nil {
-		log.Println(err)
-		return
-	}
-
-	hij, _ := w.(http.Hijacker)
-	client, _, _ := hij.Hijack()
-	client.Write([]byte("HTTP/1.0 200 Connection Established\r\n\r\n"))
-
-	done := make(chan struct{})
-	go func() {
-		if _, err := io.Copy(server, client); err != nil {
-			log.Println(err)
-		}
-		tcpServer := server.(*net.TCPConn)
-		tcpServer.CloseWrite()
-		done <- struct{}{}
-	}()
-	if _, err := io.Copy(client, server); err != nil {
-		log.Println(err)
-	}
-	tcpServer := server.(*net.TCPConn)
-	tcpServer.CloseRead()
-	<- done
-}
-
-func handleMethodNext(w http.ResponseWriter, r *http.Request, c *Connect) {
-	req, err := copyRequestNext(r)
-	if err != nil {
-		log.Println(err)
-		return
-	}
-
-	proxy := func (r *http.Request) (*url.URL, error) {
-		return url.Parse("http://" + c.nextAddr)
-	}
-	server := &http.Transport{
-		Proxy: proxy,
-		DialContext: (&net.Dialer{
-			Timeout:   30 * time.Second,
-			KeepAlive: 30 * time.Second,
-			DualStack: true,
-		}).DialContext,
-		MaxIdleConns:          100,
-		IdleConnTimeout:       90 * time.Second,
-		TLSHandshakeTimeout:   10 * time.Second,
-		ExpectContinueTimeout: 1 * time.Second,
-	}
-	resp, err := server.RoundTrip(req)
-	if err != nil {
-		log.Println(err)
-		return
-	}
-
-	for key, value := range resp.Header {
-		for _, v := range value {
-			w.Header().Add(key, v)
-		}
-	}
-	w.WriteHeader(resp.StatusCode)
-	io.Copy(w, resp.Body)
-	resp.Body.Close()
-}
-
-func copyRequestNext(r *http.Request) (*http.Request, error) {
-	req, err := http.NewRequest(r.Method, r.URL.String(), r.Body)
-	if err != nil {
-		return nil, err
-	}
-
-	for key, value := range r.Header {
-		for _, v := range value {
-			req.Header.Add(key, v)
+	if c.nextAddr == "" {
+		if proxyConn := req.Header.Get("Proxy-Connection"); proxyConn != "" {
+			req.Header.Del("Proxy-Connection")
+			req.Header.Set("Connection", proxyConn)
 		}
 	}
 
