@@ -66,7 +66,7 @@ func handleHttpConnect(w http.ResponseWriter, r *http.Request, c *Connect) {
 		server.Write([]byte(r.Method + " " + r.RequestURI + " " + r.Proto + "\r\n\r\n"))
 	}
 
-	transport(client, server)
+	transportTCP(client, server)
 }
 
 func handleHttpMethod(w http.ResponseWriter, r *http.Request, c *Connect) {
