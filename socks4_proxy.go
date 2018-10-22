@@ -33,32 +33,42 @@ func (socks4Proxy *Socks4Proxy) Start(nextAddr string) {
 			log.Println(err)
 		}
 
-		go serve(client)
+		go serve(client, nextAddr)
 	}
 }
 
-func serve(client net.Conn) {
+func serve(client net.Conn, nextAddr string) {
 	defer client.Close()
 
-	reader := bufio.NewReader(client)
-	b, err := reader.Peek(9)
-	if err != nil {
-		log.Println(err)
-		return
+	if nextAddr == "" {
+		log.Printf("client address: %s\n", client.RemoteAddr())
+	} else {
+		log.Printf("client address: %s, next address: %s\n", client.RemoteAddr(), nextAddr)
 	}
 
-	if b[0] != 0x04 {
-		log.Println(errors.New(fmt.Sprintf("version number %b is not socks4 protocol", b[0])))
-		return
-	}
+	if nextAddr == "" {
+		reader := bufio.NewReader(client)
+		b, err := reader.Peek(9)
+		if err != nil {
+			log.Println(err)
+			return
+		}
 
-	switch b[1] {
-	case 0x01:
-		handleSocks4Connect(client, b)
-	case 0x02:
-		log.Println(errors.New(fmt.Sprintf("operation %b is not supproted by socks4proxy", b[1])))
-	default:
-		log.Println(errors.New(fmt.Sprintf("operation %b is not supported by socks4 protocol", b[1])))
+		if b[0] != 0x04 {
+			log.Println(errors.New(fmt.Sprintf("version number %b is not socks4 protocol", b[0])))
+			return
+		}
+
+		switch b[1] {
+		case 0x01:
+			handleSocks4Connect(client, b)
+		case 0x02:
+			log.Println(errors.New(fmt.Sprintf("operation %b is not supproted by socks4proxy", b[1])))
+		default:
+			log.Println(errors.New(fmt.Sprintf("operation %b is not supported by socks4 protocol", b[1])))
+		}
+	} else {
+		handleOther(client, nextAddr)
 	}
 }
 
@@ -74,6 +84,30 @@ func handleSocks4Connect(client net.Conn, b []byte) {
 		return
 	}
 	client.Write([]byte{0x00, 0x5a, b[2], b[3], b[4], b[5], b[6], b[7]})
+
+	done := make(chan struct{})
+	go func() {
+		if _, err := io.Copy(server, client); err != nil {
+			log.Println(err)
+		}
+		tcpServer := server.(*net.TCPConn)
+		tcpServer.CloseWrite()
+		done <- struct{}{}
+	}()
+	if _, err := io.Copy(client, server); err != nil {
+		log.Println(err)
+	}
+	tcpServer := server.(*net.TCPConn)
+	tcpServer.CloseRead()
+	<- done
+}
+
+func handleOther(client net.Conn, nextAddr string) {
+	server, err := net.Dial("tcp", nextAddr)
+	if err != nil {
+		log.Println(err)
+		return
+	}
 
 	done := make(chan struct{})
 	go func() {
