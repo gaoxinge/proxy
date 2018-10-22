@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"encoding/binary"
-	"io"
 )
 
 type Socks4Proxy struct {
@@ -85,21 +84,7 @@ func handleSocks4Connect(client net.Conn, b []byte) {
 	}
 	client.Write([]byte{0x00, 0x5a, b[2], b[3], b[4], b[5], b[6], b[7]})
 
-	done := make(chan struct{})
-	go func() {
-		if _, err := io.Copy(server, client); err != nil {
-			log.Println(err)
-		}
-		tcpServer := server.(*net.TCPConn)
-		tcpServer.CloseWrite()
-		done <- struct{}{}
-	}()
-	if _, err := io.Copy(client, server); err != nil {
-		log.Println(err)
-	}
-	tcpServer := server.(*net.TCPConn)
-	tcpServer.CloseRead()
-	<- done
+	transport(client, server)
 }
 
 func handleOther(client net.Conn, nextAddr string) {
@@ -109,19 +94,5 @@ func handleOther(client net.Conn, nextAddr string) {
 		return
 	}
 
-	done := make(chan struct{})
-	go func() {
-		if _, err := io.Copy(server, client); err != nil {
-			log.Println(err)
-		}
-		tcpServer := server.(*net.TCPConn)
-		tcpServer.CloseWrite()
-		done <- struct{}{}
-	}()
-	if _, err := io.Copy(client, server); err != nil {
-		log.Println(err)
-	}
-	tcpServer := server.(*net.TCPConn)
-	tcpServer.CloseRead()
-	<- done
+	transport(client, server)
 }
