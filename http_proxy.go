@@ -5,6 +5,8 @@ import (
 	"net"
 	"io"
 	"log"
+	"net/url"
+	"time"
 )
 
 type HttpProxy struct{
@@ -15,30 +17,41 @@ func NewHttpProxy(addr string) *HttpProxy {
 	return &HttpProxy{addr}
 }
 
-func (httpProxy *HttpProxy) Start() {
-	connect := NewConnect()
+func (httpProxy *HttpProxy) Start(nextAddr string) {
+	connect := NewConnect(nextAddr)
 	http.ListenAndServe(httpProxy.addr, connect)
 }
 
 type Connect struct {
+	nextAddr string
 }
 
-func NewConnect() *Connect {
-	return &Connect{}
+func NewConnect(nextAddr string) *Connect {
+	return &Connect{nextAddr}
 }
 
-func (connect *Connect) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	log.Printf("receive %s request from %s to %s\n", r.Method, r.RemoteAddr, r.Host)
+func (c *Connect) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if c.nextAddr == "" {
+		log.Printf("receive %s request from %s to %s\n", r.Method, r.RemoteAddr, r.Host)
+	} else {
+		log.Printf("receive %s request from %s to %s\n", r.Method, r.RemoteAddr, c.nextAddr)
+	}
 
 	if r.Method == "CONNECT" {
-		handleHttpConnect(w, r)
+		handleHttpConnect(w, r, c)
 	} else {
-		handleHttpMethod(w, r)
+		handleHttpMethod(w, r, c)
 	}
 }
 
-func handleHttpConnect(w http.ResponseWriter, r *http.Request) {
-	server, err := net.Dial("tcp", r.Host)
+func handleHttpConnect(w http.ResponseWriter, r *http.Request, c *Connect) {
+	var server net.Conn
+	var err error
+	if c.nextAddr == "" {
+		server, err = net.Dial("tcp", r.Host)
+	} else {
+		server, err = net.Dial("tcp", c.nextAddr)
+	}
 	if err != nil {
 		log.Println(err)
 		return
@@ -46,8 +59,12 @@ func handleHttpConnect(w http.ResponseWriter, r *http.Request) {
 
 	hij, _ := w.(http.Hijacker)
 	client, _, _ := hij.Hijack()
-	client.Write([]byte("HTTP/1.0 200 Connection Established\r\n\r\n"))
 
+	if c.nextAddr == "" {
+		client.Write([]byte("HTTP/1.0 200 Connection Established\r\n\r\n"))
+	} else {
+		server.Write([]byte(r.Method + " " + r.RequestURI + " " + r.Proto + "\r\n\r\n"))
+	}
 
 	done := make(chan struct{})
 	go func() {
@@ -66,15 +83,33 @@ func handleHttpConnect(w http.ResponseWriter, r *http.Request) {
 	<- done
 }
 
-func handleHttpMethod(w http.ResponseWriter, r *http.Request) {
-	req, err := copyRequest(r)
+func handleHttpMethod(w http.ResponseWriter, r *http.Request, c *Connect) {
+	req, err := copyRequest(r, c)
 	if err != nil {
 		log.Println(err)
 		return
 	}
 
 	var server http.RoundTripper
-	server = http.DefaultTransport
+	if c.nextAddr == "" {
+		server = http.DefaultTransport
+	} else {
+		proxy := func(r *http.Request) (*url.URL, error) {
+			return url.Parse("http://" + c.nextAddr)
+		}
+		server = &http.Transport{
+			Proxy: proxy,
+			DialContext: (&net.Dialer{
+				Timeout:   30 * time.Second,
+				KeepAlive: 30 * time.Second,
+				DualStack: true,
+			}).DialContext,
+			MaxIdleConns:          100,
+			IdleConnTimeout:       90 * time.Second,
+			TLSHandshakeTimeout:   10 * time.Second,
+			ExpectContinueTimeout: 1 * time.Second,
+		}
+	}
 
 	resp, err := server.RoundTrip(req)
 	if err != nil {
@@ -94,7 +129,7 @@ func handleHttpMethod(w http.ResponseWriter, r *http.Request) {
 	resp.Body.Close()
 }
 
-func copyRequest(r *http.Request) (*http.Request, error) {
+func copyRequest(r *http.Request, c *Connect) (*http.Request, error) {
 	req, err := http.NewRequest(r.Method, r.URL.String(), r.Body)
 	if err != nil {
 		return nil, err
@@ -106,9 +141,11 @@ func copyRequest(r *http.Request) (*http.Request, error) {
 		}
 	}
 
-	if proxyConn := req.Header.Get("Proxy-Connection"); proxyConn != "" {
-		req.Header.Del("Proxy-Connection")
-		req.Header.Set("Connection", proxyConn)
+	if c.nextAddr == "" {
+		if proxyConn := req.Header.Get("Proxy-Connection"); proxyConn != "" {
+			req.Header.Del("Proxy-Connection")
+			req.Header.Set("Connection", proxyConn)
+		}
 	}
 
 	if ip, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
